@@ -1,20 +1,38 @@
 # worktree-route
 
-Multi-agent aware git worktree router. When a message references a branch or PR by name, this skill reads the live session and worktree landscape, decides whether isolation is needed, ensures the dev environment is ready, and either routes the work into the right worktree or explains why it is safe to work in-place.
+A multi-agent aware git worktree router for Claude Code (OMP). Instead of interrupting your current work to check a branch, it figures out where the work belongs, ensures that worktree is ready to run, and handles it there — all from a single natural-language message.
 
-## Components
+---
 
-| File | Type | Purpose |
-|------|------|---------|
-| `skill/SKILL.md` | Skill | Routing logic, decision matrix, dev env setup, execution patterns |
-| `agents/worktree-landscape.md` | Haiku agent | Reads `git worktree list` + live sessions + port/server status per worktree |
-| `scripts/devbox/worktree-setup.sh` | Shell script | Idempotent fresh-worktree setup: copy env, assign port, install deps, build packages |
+## The problem
 
-The landscape agent and setup script live in the main repo. The skill and haiku agent files in this repo are the standalone/distributable versions.
+When you're deep in one branch and someone asks "can you check the academy-wave1-schema PR?", you have a few bad options: stop what you're doing and switch branches (losing context), or open a new terminal and manually set up the other branch (tedious). Neither works well when multiple AI agents are running simultaneously, because you also have to know which agent is where, whether that branch's dev server is running, and what port it's on.
+
+This tool solves all of that. You say what you need, and it figures out the rest.
+
+---
+
+## How it works
+
+Three pieces work together:
+
+**1. `agents/worktree-landscape.md` — the eyes**
+
+A lightweight haiku agent that reads the entire worktree situation on demand: every git worktree, its branch, dirty file count, assigned port, whether its dev server is currently listening, and whether any live Claude Code session is running inside it. This is the source of truth for every routing decision.
+
+**2. `skill/SKILL.md` — the brain**
+
+The routing skill that interprets your request, reads the landscape, and decides what to do. It resolves branch names from natural language (or PR numbers or slugs), checks whether isolation is needed, and picks the right execution path. It knows the difference between "check it" (read-only, spawn a subagent and report back) and "fix it" (mutating, open an interactive session).
+
+**3. `scripts/worktree-setup.sh` — the hands**
+
+An idempotent setup script that makes a fresh worktree ready to run. Because each worktree is its own directory, it needs its own `node_modules`, `.env`, and a port that won't collide with other running worktrees. This script handles all of that — and is fast because pnpm's content-addressable store is shared across all worktrees.
+
+---
 
 ## Usage
 
-Say anything that names a branch or PR you want to work on:
+Just describe what you want, naming the branch or PR:
 
 ```
 academy-wave1-schema has a requested change, can you check it?
@@ -23,7 +41,9 @@ spin up the enrollment branch for me
 rebase pr-7914 for me
 ```
 
-The skill fires when the target is a **different branch** from the current one and the request involves modifying, checking, reviewing, running, or rebasing it.
+The skill triggers whenever you name a branch that isn't your current one and want to do something with it. It doesn't trigger for questions about the current branch or pure git metadata reads like `git log`.
+
+---
 
 ## Full decision flow
 
@@ -41,19 +61,15 @@ flowchart TD
 
     F -- active --> H["⚠️ CONFLICT\nNotify user — another\nagent is mid-task there"]
     F -- idle --> I["⚠️ COORDINATE\nNotify user, ask to confirm\n(idle session may have uncommitted state)"]
-    F -- none --> J{Current session\ndirty or active?}
+    F -- none --> K["ROUTE TO EXISTING WORKTREE"]
 
-    J -- yes --> K
-    J -- no --> K
-
-    K["ROUTE TO EXISTING WORKTREE"] --> DEV
-
-    G -- yes --> O["CREATE + ROUTE\ngit worktree add\n.claude/worktrees/slug branch\nthen route as above"]
+    G -- yes --> O["CREATE + ROUTE\ngit worktree add\n.claude/worktrees/slug branch"]
     G -- no --> P{Request\nmutating?}
 
     P -- yes --> O
     P -- no --> Q["IN-PLACE\nWork in current session\nno isolation needed"]
 
+    K --> DEV
     O --> DEV
 
     DEV{"Dev env\nneeded?"}
@@ -61,7 +77,7 @@ flowchart TD
     DEV -- yes --> SETUP
 
     SETUP{"SETUP =\nready?"}
-    SETUP -- needs-setup --> RUN_SETUP["bash scripts/devbox/worktree-setup.sh\n• copy .env from main worktree\n• assign deterministic port md5(branch) → 3100-3999\n• pnpm install (shared store, fast)\n• pnpm turbo build (cached, fast)"]
+    SETUP -- needs-setup --> RUN_SETUP["bash scripts/worktree-setup.sh\n• copy .env from main worktree\n• assign deterministic port md5(branch) → 3100-3999\n• pnpm install (shared store, fast)\n• pnpm turbo build (cached, fast)"]
     SETUP -- ready --> SERVER
 
     RUN_SETUP --> SERVER
@@ -73,10 +89,10 @@ flowchart TD
     START --> L
 
     L{Request type?}
-    L -- read-only / bounded --> M["spawn claude -p in worktree\n(cd path && claude -p prompt\n--no-session-persistence)\nResults stream back here"]
-    L -- complex / mutating --> N["Open interactive session\ntmux new-window -c path"]
+    L -- "read-only / bounded" --> M["spawn claude -p in worktree\n(cd path && claude -p prompt\n--no-session-persistence)\nResults stream back here"]
+    L -- "complex / mutating" --> N["Open interactive session\ntmux new-window -c path"]
 
-    M --> R["Present results\n## Results from branch worktree\n+ checklist of action items"]
+    M --> R["Present results inline\n+ checklist of action items"]
     N --> S["Confirm pane opened\nLeave breadcrumb in current session"]
 
     style H fill:#ff6b6b,color:#fff
@@ -88,100 +104,153 @@ flowchart TD
     style START fill:#f4a261,color:#fff
 ```
 
-## Routing decision matrix
+---
 
-| `target_worktree` | `target_occupied` | `current_dirty/active` | Request | Decision |
+## Routing decisions explained
+
+The skill asks three questions in sequence:
+
+**1. Is a conflicting agent already there?**
+It checks whether any live Claude Code session is running inside the target worktree. If one is actively processing a prompt, it stops and tells you — two agents writing to the same branch simultaneously will corrupt each other's work. If a session is there but idle, it warns you and asks to confirm (the idle session may have uncommitted state).
+
+**2. Does a worktree for this branch already exist?**
+If yes, it routes there directly regardless of what the current session is doing. Isolation is almost always worth it — keeping branches separate means you never accidentally commit changes from the wrong context.
+
+If no worktree exists, it checks whether the current session has in-flight work (dirty files or active processing). If it does, it creates a new worktree. If the current session is clean and the request is read-only, it can just handle it in-place.
+
+**3. Does the request need a running dev server?**
+For code reviews and PR checks, no server is needed — the skill spawns a `claude -p` subprocess in the worktree and streams the result back. For UI work, E2E testing, or "spin it up" requests, it checks whether the worktree's server is running and starts it if not.
+
+The full matrix:
+
+| Worktree exists | Occupied by | Current session | Request type | Decision |
 |---|---|---|---|---|
-| exists | active session | any | any | **CONFLICT** — stop, notify |
-| exists | idle session | any | any | **COORDINATE** — notify, confirm |
-| exists | none | yes | any | **ROUTE TO EXISTING** |
-| exists | none | no | any | **ROUTE TO EXISTING** |
-| missing | — | yes | any | **CREATE + ROUTE** |
-| missing | — | no | mutating | **CREATE + ROUTE** |
-| missing | — | no | read-only | **IN-PLACE** |
+| yes | active agent | any | any | **CONFLICT** — stop |
+| yes | idle agent | any | any | **COORDINATE** — confirm first |
+| yes | nobody | any | any | **ROUTE THERE** |
+| no | — | dirty / active | any | **CREATE + ROUTE** |
+| no | — | clean | mutating | **CREATE + ROUTE** |
+| no | — | clean | read-only | **IN-PLACE** |
+
+---
 
 ## Dev environment setup
 
-Each worktree is its own directory — it needs its own `node_modules`, `.env`, and an assigned port before `devbox run dev` will work.
+Each git worktree is an independent directory. It does not share `node_modules`, `.env`, or a port assignment with the main checkout. Running `devbox run dev` in a fresh worktree without setup will fail or collide with the main worktree's port.
 
-### `worktree-setup.sh`
-
-Idempotent. Run once after `git worktree add`:
+`worktree-setup.sh` solves this idempotently. Run it once after creating a new worktree:
 
 ```bash
-bash scripts/devbox/worktree-setup.sh
-# or from outside the worktree:
-(cd .claude/worktrees/<slug> && bash scripts/devbox/worktree-setup.sh)
+bash scripts/worktree-setup.sh
 ```
 
-What it does:
+### What it does
 
-1. **Copy `.env`** from the main worktree — avoids the interactive `gcloud auth` prompt that `env:setup` requires
-2. **Assign a deterministic port** — `3100 + md5(branch_name) % 900` — consistent across machines and restarts. Walks forward if the hashed port is already taken.
-3. **Write port** to `.devbox/worktree-port` and `PORT=` in `.env.local` so `dev.sh` picks it up
-4. **`pnpm install`** — fast because pnpm's content-addressable store is shared across worktrees (symlinks, not copies)
-5. **`pnpm turbo build --filter='./packages/*'`** — fast on warm Turbo cache (~10s)
+**Copy `.env`** — The main worktree's `.env` holds dev secrets pulled from GCP. Copying it avoids the interactive `gcloud auth` flow that running `env:setup` from scratch requires. New worktrees get identical secrets instantly.
 
-### Port assignment
+**Assign a deterministic port** — Each branch gets a port in the range 3100–3999, computed as `3100 + md5(branch_name) % 900`. The same branch always gets the same port across machines and restarts, so you never have to look it up. If the assigned port happens to be taken, it walks forward until it finds a free one. The result is written to two places:
+  - `.devbox/worktree-port` — read by the landscape agent and `dev.sh`
+  - `PORT=` in `.env.local` — tells `devbox run dev` where to start scanning
 
-| Worktree | Port |
-|----------|------|
-| Main (`app-gc-ai`) | 3000 (default) |
-| Any worktree after setup | 3100–3999 (md5 hash of branch name) |
-| Worktree started without setup | scans from 3000 — may conflict with main |
+**Install dependencies** — `pnpm install` is fast here because pnpm uses a content-addressable store shared across all worktrees. Each worktree gets its own `node_modules` directory (required for tooling to work), but the actual package files are hard-linked from the shared store rather than copied. A second worktree for the same repo typically installs in seconds.
 
-Multiple worktrees can run simultaneously without collision as long as each was set up via `worktree-setup.sh` or started via `devbox run dev` (which increments past taken ports and writes the result back to `.devbox/worktree-port`).
+**Build shared packages** — `pnpm turbo build --filter='./packages/*'` compiles the 13 internal `@gcai/*` packages that Next.js and other apps import. Turbo's cache is also shared, so a warm-cache build takes ~10 seconds. A stamp file (`.devbox/last-pnpm-build`) records that this has been done.
 
-### What `devbox run dev` does with a pre-assigned port
+### Port design
 
-`dev.sh`'s `find_free_port` starts scanning from `${PORT:-3000}`. Because `worktree-setup.sh` wrote `PORT=<assigned>` into `.env.local`, the scan starts at the pre-assigned port rather than 3000, so it lands there immediately (unless something else grabbed it in the meantime). The final selected port is written back to `.devbox/worktree-port`.
+The main worktree always uses 3000 (the Next.js default). Worktrees set up via this script use 3100–3999. This separation means running the main checkout and any number of worktrees simultaneously won't collide, as long as each was set up with `worktree-setup.sh`.
 
-### Landscape agent output (with dev env columns)
+`devbox run dev` also writes the port it selects back to `.devbox/worktree-port`. So whether a worktree was set up in advance by this script or started cold by `devbox run dev`, the landscape agent can always find its port by reading that file.
+
+```
+Main worktree     → port 3000   (always)
+academy-wave1     → port 3421   (md5("academy-wave1-schema") % 900 + 3100)
+fix/gce-3972      → port 3187   (md5("fix/gce-3972-multi-transcript") % 900 + 3100)
+feature/foo       → port 3634   (md5("feature/foo") % 900 + 3100)
+```
+
+---
+
+## Landscape agent output
+
+Before every routing decision, the skill asks the `worktree-landscape` haiku agent for a snapshot. Here's what that looks like with dev env columns included:
 
 ```
 Repo root: /Users/peter/code/app-gc-ai
 
-Worktrees (3):
-  TYPE  BRANCH                      DIRTY  PORT   SERVER   SETUP        SESSIONS
-  main  gce-3514-enrollment-…       1      3000   running  ready        idle (pid=58017)
-  wt    academy-wave1-schema         0      3421   stopped  ready        none
-  wt    fix/gce-3972-multi-…        0      unassigned  -   needs-setup  none
+Worktrees (4):
+  TYPE  BRANCH                      DIRTY  PORT        SERVER   SETUP        SESSIONS
+  main  gce-3514-enrollment-…       1      3000        running  ready        idle (pid=58017)
+  wt    academy-wave1-schema         0      3421        stopped  ready        none
+  wt    fix/gce-3972-multi-…        0      3187        stopped  ready        none
+  wt    feature/new-dashboard        0      unassigned  -        needs-setup  none
 
 Live sessions (1):
   pid=58017  cwd=/Users/peter/code/app-gc-ai  status=idle  sid=a1d9407e  worktree=main
 ```
 
+**SETUP** tells the skill whether it needs to run `worktree-setup.sh` before the worktree is usable:
+- `ready` — `.env` present, `node_modules` exists, packages built
+- `needs-setup` — one or more of those missing; run the setup script
+- `env-missing` — `.env` is absent; most urgent, nothing works without it
+
+**SERVER** tells the skill whether there's a live dev server to point the user at:
+- `running` — port is currently listening
+- `stopped` — port assigned but nothing there
+- `-` — port never assigned; server has never started in this worktree
+
+---
+
 ## Execution patterns
 
-### Read-only check (results reported back)
+### Read-only (results piped back to current session)
+
+For code reviews, PR summaries, diff reads — anything that doesn't need to commit:
 
 ```bash
 (cd <worktree_path> && claude -p "<prompt>" --no-session-persistence 2>&1)
 ```
 
-### Complex / mutating work (interactive)
+The subagent runs in the worktree's directory with full access to that branch's files. Its output streams back into the current session, formatted under a `## Results from <branch> worktree` header with any action items as a checklist.
+
+### Interactive (complex or mutating work)
+
+For multi-step fixes, rebases, or anything that needs back-and-forth:
 
 ```bash
 tmux new-window -c <worktree_path> "claude"
 ```
 
-### Dev server (in a named tmux window)
+Opens a full Claude Code session in a new tmux window. The current session leaves a note about what was delegated.
+
+### Dev server
+
+For work that needs the app running:
 
 ```bash
 tmux new-window -c <worktree_path> -n "<branch>" "devbox run dev"
-# Dev server URL: http://localhost:<port>
+# → http://localhost:<port>
 ```
 
-## Example end-to-end
+---
 
-**Input:** `academy-wave1-schema has a requested change, can you check it?`
+## End-to-end example
 
-1. Skill resolves target: `academy-wave1-schema` → worktree at `~/code/academy-wave1-schema`
-2. Landscape agent reports: current dirty=1, target clean, no sessions, port=3421, server=stopped, setup=ready
-3. Decision: **ROUTE TO EXISTING WORKTREE** (current has in-flight work)
-4. Request is read-only (check PR) → no dev server needed
-5. Spawns `claude -p` in `~/code/academy-wave1-schema`
-6. Returns:
+**You type:** `academy-wave1-schema has a requested change, can you check it?`
+
+**Step 1 — resolve:** The skill identifies `academy-wave1-schema` as the target branch.
+
+**Step 2 — landscape:** The haiku agent reports that there's an existing worktree at `~/code/academy-wave1-schema`, it's clean (0 dirty files), no sessions are in it, its port is 3421, the server is stopped, and setup is ready.
+
+Meanwhile, the current session is in the main worktree with 1 dirty file.
+
+**Step 3 — route:** ROUTE TO EXISTING WORKTREE. The current session has in-flight work, so we don't touch it.
+
+**Step 4 — dev env:** The request is a PR code review — no running server needed. Skip setup check.
+
+**Step 5 — execute:** Spawns `claude -p` in `~/code/academy-wave1-schema` with a prompt to fetch the PR's review threads and summarize them.
+
+**Result piped back:**
 
 ```
 ## Results from academy-wave1-schema worktree
@@ -189,18 +258,32 @@ tmux new-window -c <worktree_path> -n "<branch>" "devbox run dev"
 PR #7931 — chore(db): add Zoom per-attendee registrant columns
 State: OPEN · CHANGES_REQUESTED
 
-Requested change (Codex bot, 1 unresolved):
+Requested change (1 unresolved, Codex bot):
 - packages/db/src/schema/academy.ts:263
-  The redaction-state check constraint doesn't cover registrantId / registrantJoinUrl.
-  Add both columns so the PII erasure invariant holds.
+  The pii_redaction_state check constraint covers email and name but not the
+  new registrantId / registrantJoinUrl columns, which also hold PII.
+  Add both to the constraint so the erasure invariant holds.
 
-Recommendation: add the two columns to the constraint, then pnpm db:generate.
+Recommendation: update the constraint, then run pnpm db:generate.
 ```
+
+---
+
+## Installation
+
+1. Copy `agents/worktree-landscape.md` to `~/.claude/agents/` — this makes it available as a haiku subagent in any project.
+2. Copy `skill/SKILL.md` to your project's `.agents/skills/worktree-route/SKILL.md`.
+3. Copy `scripts/worktree-setup.sh` to your project's scripts directory and `chmod +x` it.
+4. Add two lines to your `dev.sh` after port selection (see `scripts/dev-sh-patch.md`) to persist the selected port.
+
+---
 
 ## Notes
 
-- **`.devbox/` is gitignored** — `worktree-port` and `last-pnpm-build` are local state, never committed
-- **pnpm shared store** — `pnpm install` across worktrees deduplicates package content via hard links; each worktree gets its own `node_modules` symlink tree but shares the underlying files
-- **Detached HEAD worktrees** (like `academy-wave1-schema` which was created from a specific commit) are treated normally; branch name falls back to the directory basename for port hashing
-- **Stale sessions** in `~/.claude/sessions/` are filtered by live PID (`kill -0`) — dead entries are ignored
-- **Port collision** between two worktrees is prevented by the deterministic hash spreading assignments across 3100–3999; actual collisions are resolved at runtime by walking forward
+**`.devbox/` is gitignored** — `worktree-port` and `last-pnpm-build` are machine-local state. They never get committed, which is correct — different machines may assign different ports if the base port is taken.
+
+**Stale sessions are filtered** — `~/.claude/sessions/*.json` entries persist after a session ends. The landscape agent checks each PID with `kill -0` and silently skips any that aren't alive.
+
+**Detached HEAD worktrees** work fine. `academy-wave1-schema` was created from a specific commit with no local branch name. The port hash falls back to the directory basename, which is stable.
+
+**Port collisions are rare but handled** — with 900 slots and typically 3–5 active worktrees, collisions are unlikely. When they do occur, `worktree-setup.sh` walks forward from the hashed port until it finds a free one, then persists that actual port.
