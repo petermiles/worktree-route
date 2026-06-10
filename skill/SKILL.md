@@ -1,6 +1,6 @@
 ---
 name: worktree-route
-description: Multi-agent aware worktree router. When a message references a branch, PR, or worktree by name and asks to check/review/fix it, this skill reads the live worktree and session landscape, makes an isolation decision, and either routes the work into the right worktree or explains why it's safe to work in-place. Use when the user mentions a branch/PR name with intent to work on it (e.g. "academy-wave1-schema has a requested change, can you check it?", "can you look at the fix/gce-3972 branch?", "rebase pr-7914 for me").
+description: Multi-agent aware worktree router. When a message references a branch, PR, or worktree by name and asks to check/review/fix it, this skill reads the live worktree and session landscape, makes an isolation decision, routes the work into the right worktree, and ensures the dev environment (deps, port, dev server) is ready. Use when the user mentions a branch/PR name with intent to work on it (e.g. "academy-wave1-schema has a requested change, can you check it?", "can you look at the fix/gce-3972 branch?", "rebase pr-7914 for me", "spin up the enrollment branch for me").
 ---
 
 > **Before starting:** Run `node .claude/track-skill.mjs embedded worktree-route`
@@ -169,6 +169,86 @@ For interactive (`--tmux`) spawns:
 - Confirm to the user the session was opened and in which pane
 - Leave a breadcrumb: add a note to the current conversation about what was delegated
 
+
+---
+
+## Dev environment setup
+
+When routing work that involves **running the app** (UI changes, E2E testing, server behavior),
+check whether the target worktree's dev server is ready before handing off.
+
+### Check server status from the landscape
+
+The `worktree-landscape` agent now reports three extra columns per worktree:
+- `PORT` — the port assigned to this worktree's dev server (from `.devbox/worktree-port`)
+- `SERVER` — `running` / `stopped` / `-` (never started)
+- `SETUP` — `ready` / `needs-setup` / `env-missing`
+
+### Fresh worktree — run setup first
+
+If `SETUP = needs-setup` or `env-missing`, run the setup script before routing:
+
+```bash
+(cd <target_worktree_path> && bash scripts/devbox/worktree-setup.sh)
+```
+
+This is idempotent and fast (~30s on warm cache):
+1. Copies `.env` from the main worktree (no interactive auth)
+2. Assigns a deterministic port (md5 hash of branch name → 3100–3999), writes it to `.devbox/worktree-port` and `PORT=` in `.env.local`
+3. `pnpm install` — fast because pnpm's content-addressable store is shared across all worktrees
+4. `pnpm turbo build --filter='./packages/*'` — fast on warm Turbo cache
+
+Tell the user: "Setting up the `<branch>` worktree (port `<N>`)..."
+
+### Start the dev server
+
+If `SERVER = stopped` or `-` and the task needs a running server:
+
+```bash
+# Interactive (recommended for ongoing UI work):
+tmux new-window -c <target_worktree_path> -n "<branch>" "devbox run dev"
+
+# Or print the command for the user to run in their terminal:
+echo "cd <path> && devbox run dev"
+```
+
+`devbox run dev` will:
+1. Pick up the pre-assigned `PORT` from `.env.local` as the starting point for its `find_free_port` scan
+2. Write the final selected port back to `.devbox/worktree-port`
+3. Start the three services: `watch` (turbo build watcher), `worker` (Graphile), `nextjs` (Next.js dev server)
+
+### Port reference
+
+| Worktree | Port strategy |
+|----------|--------------|
+| Main (`app-gc-ai`) | 3000 (default, `find_free_port` from 3000) |
+| Any worktree after `worktree-setup.sh` | 3100–3999 (md5 hash of branch name) |
+| Worktree started without setup | `find_free_port` from 3000 (same as main — may collide) |
+
+Multiple worktrees can run simultaneously without port conflict as long as each was set up via `worktree-setup.sh` or started via `devbox run dev` (which increments past taken ports).
+
+### When NOT to start the server
+
+Skip server startup for:
+- Schema-only or migration PRs (no UI to run)
+- Pure code review / diff checks
+- Backend-only fixes with no browser interaction needed
+- The user explicitly says "just check the code, don't run it"
+
+### Full routing + setup decision tree
+
+```
+target_setup = landscape SETUP column
+target_server = landscape SERVER column
+request_needs_server = (UI changes OR E2E OR "run it" OR "open it")
+
+if target_setup != "ready":
+  → run worktree-setup.sh first
+
+if request_needs_server AND target_server != "running":
+  → open tmux window with devbox run dev
+  → tell user the URL: http://localhost:<port>
+```
 ---
 
 ## Worktree lifecycle
